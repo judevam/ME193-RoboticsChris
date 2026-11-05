@@ -24,7 +24,7 @@ XML = """
     <body name="box" pos="0.5 0.5 1.5">
       <freejoint/>
       <!-- solref = "-stiffness -damping" of the contact. Less damping = bouncier. -->
-      <geom type="box" size=".2 .2 .2" rgba="0 0 0 1" solref="-40000 -10"/>
+      <geom type="box" size=".3 .3 .3" rgba="0 0 0 1" solref="-40000 -10"/>
     </body>
   </worldbody>
 </mujoco>
