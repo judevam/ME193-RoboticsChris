@@ -72,9 +72,12 @@ def lowest_point(model, data):
     return low
 
 
-def reset(model, data, clearance=0.005, leg_angles=None):
-    """Put the robot back at the start, just above the floor. leg_angles: optional (left, right) start angles in rad."""
+def reset(model, data, clearance=0.005, leg_angles=None, yaw=0.0):
+    """Put the robot back at the start, just above the floor.
+    leg_angles: optional (left, right) start angles in rad. yaw: start heading in rad (0 = the body axes line up with the world)."""
     mujoco.mj_resetData(model, data)
+    if yaw:
+        data.qpos[3:7] = [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]    # the free joint's orientation: a turn about vertical
     if leg_angles is not None:
         for name, angle in zip((LEFT, RIGHT), leg_angles):
             data.qpos[model.joint(name).qposadr[0]] = angle

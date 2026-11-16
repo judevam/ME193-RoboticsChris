@@ -13,6 +13,7 @@ Goal: move toward +y as fast as possible, without tipping over, flipping, or dri
 The motor limits are in walker.py: a policy can only be as good as the motors allow.
 """
 import argparse
+import copy
 import csv
 import os
 
@@ -36,9 +37,10 @@ SPEED_CAP = 0.3        # m/s: speed beyond this earns no extra reward
 # Each is multiplied by its weight and added up every step. Positive = reward, negative = penalty.
 W = dict(
     forward=10.0,      # + speed toward +y (m/s, capped at SPEED_CAP)
-    sideways=2.0,      # - |speed along x|                  (do not drift sideways)
+    sideways=1.0,      # - |speed along x|                  (do not drift sideways)
+    off_line=1.0,      # - how far the robot is from the straight line it started on (m)
     spin=0.2,          # - |turning rate about the vertical| (rad/s)
-    heading=0.1,       # - (heading angle off +y)^2          (keep pointing the right way)
+    heading=0.5,       # - (heading angle off +y)^2          (keep pointing the right way)
     upright=0.3,       # + how upright the body is (0 to 1)
     alive=0.0,         # + for every step it stays up (0 = off; the fall penalty already says 'stay up')
     energy=0.05,       # - motor power (watts)                (little effort)
@@ -46,16 +48,36 @@ W = dict(
     fall=5.0,          # - once, when it falls over (the episode ends)
 )
 
-OBS_DIM, ACT_DIM = 17, 2
+OBS_DIM, ACT_DIM = 20, 2
+
+# ---------------------------------------------------------------- domain randomization (edit these!)
+# Every episode gets a slightly different robot and world, so the policy learns something that works across the
+# whole range instead of one exact simulation. Each (low, high) is a multiplier on the nominal value.
+# Train with --no-dr to switch all of this off.
+DR = dict(
+    friction=(0.5, 1.5),           # floor and foot grip
+    mass=(0.8, 1.2),               # chassis and each leg separately (inertia scales with it)
+    torque_limit=(0.7, 1.3),       # how hard the motors can push
+    motor_gain=(0.7, 1.3),         # how stiffly they follow the speed command
+    joint_friction=(0.2, 4.0),     # friction and damping in the leg joints
+    start_yaw=0.2,                 # +- rad: the robot starts pointing a little off straight
+    action_delay=(0, 1),           # control steps (20 ms each) between the command and the motor
+    push_prob=0.004,               # chance per step of a random shove (about one per 5 s)
+    push_speed=0.05,               # m/s added by a shove, in a random direction
+)
+# Noise added to what the policy sees (one number per observation, in the order of _obs_one)
+OBS_NOISE = np.array([0.01] * 3 + [0.05] * 3 + [0.01] * 4 + [0.01] * 2 + [0.005] * 3 + [0.02, 0.02, 0.005] + [0.0] * 2)
 FREEZE_NORM = 40       # training iterations during which the observation scaling is still adapting
 
 
 class WalkerEnv:
     """N copies of the robot. step() takes the leg commands (N x 2, each -1..1) and returns (obs, reward, info)."""
 
-    def __init__(self, n, seed=0):
+    def __init__(self, n, seed=0, dr=False):
         self.n = n
+        self.dr = dr
         self.model = walker.load()
+        self.models = [copy.copy(self.model) for _ in range(n)] if dr else [self.model] * n   # one world each, if randomizing
         self.data = [mujoco.MjData(self.model) for _ in range(n)]
         self.rng = np.random.default_rng(seed)
         m = self.model
@@ -66,38 +88,75 @@ class WalkerEnv:
         self.gyro = m.sensor_adr[m.sensor("gyro").id]
         self.sign = np.array([walker.SIGN[walker.LEFT], walker.SIGN[walker.RIGHT]])
         self.t = np.zeros(n, int)
+        self.x0 = np.zeros(n)    # where each robot started sideways, so we can measure drift
         self.last_a = np.zeros((n, ACT_DIM))
+        self.delay = np.zeros(n, int)
+        if dr:   # remember the nominal numbers, so every episode randomizes from them (not from the last episode)
+            b = self.model
+            self.bodies = [b.body(name).id for name in ("chassis", "leg_left", "leg_right")]
+            self.nominal = dict(mass=b.body_mass.copy(), inertia=b.body_inertia.copy(), friction=b.geom_friction.copy(),
+                                forcerange=b.actuator_forcerange.copy(), gain=b.actuator_gainprm.copy(),
+                                bias=b.actuator_biasprm.copy(), floss=b.dof_frictionloss.copy(), damping=b.dof_damping.copy())
+            self.solid = [g for g in range(b.ngeom) if b.geom_contype[g] or b.geom_conaffinity[g]]   # floor and robot collision geoms
         for i in range(n):
             self.reset_one(i)
 
+    def _randomize(self, i):
+        m, nom, u = self.models[i], self.nominal, self.rng.uniform
+        for body in self.bodies:
+            k = u(*DR["mass"])
+            m.body_mass[body], m.body_inertia[body] = nom["mass"][body] * k, nom["inertia"][body] * k
+        m.geom_friction[self.solid, 0] = nom["friction"][self.solid, 0] * u(*DR["friction"])   # all alike: the contact uses the larger
+        m.actuator_forcerange[:] = nom["forcerange"] * u(*DR["torque_limit"])
+        k = u(*DR["motor_gain"])
+        m.actuator_gainprm[:, 0], m.actuator_biasprm[:, 2] = nom["gain"][:, 0] * k, nom["bias"][:, 2] * k
+        k = u(*DR["joint_friction"])
+        m.dof_frictionloss[:], m.dof_damping[:] = nom["floss"] * k, nom["damping"] * k
+        mujoco.mj_setConst(m, self.data[i])   # recompute what depends on the masses
+        self.delay[i] = self.rng.integers(DR["action_delay"][0], DR["action_delay"][1] + 1)
+
     def reset_one(self, i):
         d = self.data[i]
-        walker.reset(self.model, d, leg_angles=self.rng.uniform(-np.pi, np.pi, 2))
+        if self.dr:
+            mujoco.mj_resetData(self.models[i], d)
+            self._randomize(i)
+        yaw = self.rng.uniform(-DR["start_yaw"], DR["start_yaw"]) if self.dr else 0.0
+        walker.reset(self.models[i], d, leg_angles=self.rng.uniform(-np.pi, np.pi, 2), yaw=yaw)
         self.t[i] = 0
+        self.x0[i] = d.qpos[0]
         self.last_a[i] = 0.0
 
     def _obs_one(self, i):
         d = self.data[i]
         R = d.xmat[self.chassis].reshape(3, 3)
         angle = d.qpos[self.qadr]
+        yaw = np.arctan2(R[1, 0], R[0, 0])
         return np.concatenate([
             R[2],                                    # which way is up, seen from the robot
             d.sensordata[self.gyro:self.gyro + 3],   # turning rates
             np.sin(angle), np.cos(angle),            # the two leg angles
             d.qvel[self.vadr] / walker.MAX_SPEED,    # leg speeds
             R.T @ d.qvel[:3],                        # the robot's own velocity, in its own frame
+            [np.sin(yaw), np.cos(yaw), d.qpos[0] - self.x0[i]],   # heading (sin, cos) and sideways offset
             self.last_a[i],
         ])
 
     def obs(self):
-        return np.array([self._obs_one(i) for i in range(self.n)], dtype=np.float32)
+        o = np.array([self._obs_one(i) for i in range(self.n)])
+        if self.dr:
+            o = o + self.rng.normal(size=o.shape) * OBS_NOISE   # the policy never sees the world perfectly
+        return o.astype(np.float32)
 
     def step(self, action):
         a = np.clip(action, -1, 1)
         reward, fell, terms = np.zeros(self.n), np.zeros(self.n, bool), {k: np.zeros(self.n) for k in W}
         for i, d in enumerate(self.data):
-            d.ctrl[self.act] = self.sign * a[i] * walker.MAX_SPEED
-            mujoco.mj_step(self.model, d, nstep=SUBSTEPS)
+            applied = self.last_a[i] if self.delay[i] else a[i]   # a delayed motor uses the command from one step ago
+            d.ctrl[self.act] = self.sign * applied * walker.MAX_SPEED
+            if self.dr and self.rng.random() < DR["push_prob"]:
+                angle = self.rng.uniform(0, 2 * np.pi)
+                d.qvel[0:2] += DR["push_speed"] * np.array([np.cos(angle), np.sin(angle)])
+            mujoco.mj_step(self.models[i], d, nstep=SUBSTEPS)
             R = d.xmat[self.chassis].reshape(3, 3)
             gyro = d.sensordata[self.gyro:self.gyro + 3]
             vx, vy = d.qvel[0], d.qvel[1]
@@ -106,6 +165,7 @@ class WalkerEnv:
             fell[i] = up < FALL_UP
             terms["forward"][i] = np.clip(vy, -SPEED_CAP, SPEED_CAP)
             terms["sideways"][i] = -abs(vx)
+            terms["off_line"][i] = -abs(d.qpos[0] - self.x0[i])
             terms["spin"][i] = -abs(R[2] @ gyro)
             terms["heading"][i] = -yaw ** 2
             terms["upright"][i] = max(up, 0.0)
@@ -156,7 +216,7 @@ class Agent(nn.Module):
 
 def train(args):
     torch.manual_seed(args.seed)
-    env = WalkerEnv(args.envs, args.seed)
+    env = WalkerEnv(args.envs, args.seed, dr=not args.no_dr)
     env.t = env.rng.integers(0, EPISODE_STEPS, args.envs)   # stagger the episodes so each batch mixes all stages
     agent, norm = Agent(), Normalizer()
     opt = torch.optim.Adam(agent.parameters(), lr=3e-4)
@@ -254,12 +314,13 @@ def evaluate(agent, norm, seconds=10.0, video="walker_trained.mp4"):
     camera.trackbodyid = env.chassis
     camera.distance, camera.azimuth, camera.elevation = 0.45, 0, -20
     d = env.data[0]
-    start_y, frames, falls, energy = d.qpos[1], [], 0, 0.0
+    start_y, frames, falls, energy, worst = d.qpos[1], [], 0, 0.0, 0.0
     for _ in range(int(seconds / 0.02)):
         with torch.no_grad():
             act = agent.actor(norm(torch.tensor(env.obs()))).numpy()   # the mean action
         _, _, info = env.step(act)
         energy += float(-info["terms"]["energy"][0]) * 0.02
+        worst = max(worst, abs(d.qpos[0] - env.x0[0]))
         if renderer:
             renderer.update_scene(d, camera=camera)
             frames.append(renderer.render())
@@ -271,23 +332,48 @@ def evaluate(agent, norm, seconds=10.0, video="walker_trained.mp4"):
         renderer.close()
         imageio.mimwrite(video, frames, fps=50)
         print(f"wrote {video}: {len(frames)} frames")
-    print(f"in {seconds:g} s: moved {d.qpos[1] - start_y:+.2f} m toward +y since the last start, sideways {d.qpos[0]:+.2f} m, "
+    print(f"in {seconds:g} s: moved {d.qpos[1] - start_y:+.2f} m toward +y since the last start, sideways {d.qpos[0] - env.x0[0]:+.2f} m (at most {worst:.2f} m off the line), "
           f"fell {falls} times, used {energy:.2f} J")
+
+
+def stress_test(agent, norm, episodes=32, seed=999):
+    """Run the policy in many randomized worlds (the same ones for any policy) and report how it does on average."""
+    env = WalkerEnv(episodes, seed=seed, dr=True)
+    start = np.array([d.qpos[1] for d in env.data])
+    worst, fell = np.zeros(episodes), np.zeros(episodes, bool)
+    frozen = np.zeros(episodes, bool)       # an episode that fell stops counting
+    dist = np.zeros(episodes)
+    for _ in range(EPISODE_STEPS):
+        with torch.no_grad():
+            act = agent.actor(norm(torch.tensor(env.obs()))).numpy()
+        _, _, info = env.step(act)
+        for i, d in enumerate(env.data):
+            if not frozen[i]:
+                worst[i] = max(worst[i], abs(d.qpos[0] - env.x0[i]))
+                dist[i] = d.qpos[1] - start[i]
+        fell |= info["fell"] & ~frozen
+        frozen |= info["fell"]
+    print(f"stress test, {episodes} randomized worlds of 10 s: moved {dist.mean():+.2f} m toward +y on average "
+          f"(worst {dist.min():+.2f}), drifted at most {worst.mean():.2f} m off the line on average (worst {worst.max():.2f}), "
+          f"fell in {int(fell.sum())} of {episodes}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--iters", type=int, default=200, help="training iterations (each is 128 steps in each world)")
+    ap.add_argument("--iters", type=int, default=400, help="training iterations (each is 128 steps in each world)")
     ap.add_argument("--envs", type=int, default=64, help="how many robots to simulate at once")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eval", action="store_true", help="skip training; replay walker_policy.pt")
+    ap.add_argument("--no-dr", action="store_true", help="train without domain randomization (the nominal robot only)")
+    ap.add_argument("--policy", default="walker_policy.pt", help="with --eval: which saved policy to replay")
     args = ap.parse_args()
     torch.set_num_threads(2)
     if args.eval:
-        ckpt = torch.load("walker_policy.pt", weights_only=False)
+        ckpt = torch.load(args.policy, weights_only=False)
         agent, norm = Agent(), Normalizer()
         agent.load_state_dict(ckpt["agent"])
         norm.mean, norm.var, norm.count = ckpt["mean"], ckpt["var"], ckpt["count"]
     else:
         agent, norm = train(args)
     evaluate(agent, norm)
+    stress_test(agent, norm)
