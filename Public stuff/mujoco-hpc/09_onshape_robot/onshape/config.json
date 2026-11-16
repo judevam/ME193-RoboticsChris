@@ -1,5 +1,5 @@
 {
-  "url": "PASTE THE URL OF YOUR ONSHAPE DOCUMENT HERE",
+  "url": "https://cad.onshape.com/documents/b354c685681a7fc9cca7fedb/w/03eeda44109af96261b7413f/e/a8db4de5194c0c1c2094136c",
   "assembly_name": "robot",
   "output_format": "mujoco"
 }
