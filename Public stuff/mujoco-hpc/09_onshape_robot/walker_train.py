@@ -7,8 +7,10 @@
 Files written next to the script: walker_policy.pt (the trained network), walker_log.csv (reward terms per iteration,
 for plotting), walker_trained.mp4 (the policy running, with the numbers printed at the end).
 
-The task: the robot starts on the floor with its legs at random angles. Every 20 ms the policy chooses how fast each
-leg turns (-1 = full speed one way, +1 = full speed the other, in the direction that pushes the robot toward +y).
+The task: the robot starts on the floor with its legs at random angles. Every 20 ms the policy chooses two numbers
+between -1 and 1: how fast to go forward (1 = both legs at full speed, pushing toward +y) and how much to turn
+(positive = counter-clockwise). On top of that a simple built-in steering rule pulls the robot back toward the straight line,
+so the policy only has to learn the rest.
 Goal: move toward +y as fast as possible, without tipping over, flipping, or drifting sideways, using little energy.
 The motor limits are in walker.py: a policy can only be as good as the motors allow.
 """
@@ -49,6 +51,17 @@ W = dict(
 )
 
 OBS_DIM, ACT_DIM = 20, 2
+TURN_RANGE = 0.5       # a turn command of 1 makes the legs differ by this fraction of the full leg speed
+VERSION = 2            # saved policies are tagged with this: a policy from an older action layout is refused
+
+# ---------------------------------------------------------------- the built-in steering rule
+# It steers toward a heading that points back at the line (the further off, the more it angles in), then turns to
+# match that heading. The policy's own turn command is added to it. Set both gains to 0 to switch it off.
+K_X = 6.0              # rad of heading aimed back at the line, per metre off the line
+K_YAW = 4.0            # turn command per rad of heading error
+MAX_AIM = 0.4          # rad: never aim more than this off straight
+POLICY_TURN = 0.25     # how much the policy's own turn command can add to the rule (1 = as much as the whole turn range).
+                       # Kept small: when it could add more, it learned a large, noisy turn that fought the steering rule.
 
 # ---------------------------------------------------------------- domain randomization (edit these!)
 # Every episode gets a slightly different robot and world, so the policy learns something that works across the
@@ -152,7 +165,13 @@ class WalkerEnv:
         reward, fell, terms = np.zeros(self.n), np.zeros(self.n, bool), {k: np.zeros(self.n) for k in W}
         for i, d in enumerate(self.data):
             applied = self.last_a[i] if self.delay[i] else a[i]   # a delayed motor uses the command from one step ago
-            d.ctrl[self.act] = self.sign * applied * walker.MAX_SPEED
+            R0 = d.xmat[self.chassis].reshape(3, 3)
+            aim = np.clip(K_X * (d.qpos[0] - self.x0[i]), -MAX_AIM, MAX_AIM)    # heading that points back at the line
+            steer = K_YAW * (aim - np.arctan2(R0[1, 0], R0[0, 0]))             # the built-in rule: turn toward it
+            forward = applied[0] * walker.MAX_SPEED
+            turn = np.clip(POLICY_TURN * np.clip(applied[1], -1, 1) + steer, -1, 1) * TURN_RANGE * walker.MAX_SPEED
+            speeds = np.clip([forward - turn, forward + turn], -walker.MAX_SPEED, walker.MAX_SPEED)   # left, right: the right leg faster turns it counter-clockwise (checked while walking)
+            d.ctrl[self.act] = self.sign * speeds
             if self.dr and self.rng.random() < DR["push_prob"]:
                 angle = self.rng.uniform(0, 2 * np.pi)
                 d.qvel[0:2] += DR["push_speed"] * np.array([np.cos(angle), np.sin(angle)])
@@ -294,9 +313,11 @@ def train(args):
         if it % 10 == 0 or it == 1:
             print(f"{it:5d} {mean_r:12.3f} {speed / T:12.3f} {fall_rate:12.1f}", flush=True)
         if it % 50 == 0:
-            torch.save(dict(agent=agent.state_dict(), mean=norm.mean, var=norm.var, count=norm.count), "walker_policy.pt")
+            torch.save(dict(agent=agent.state_dict(), mean=norm.mean, var=norm.var, count=norm.count, version=VERSION,
+                            steer=(K_X, K_YAW, POLICY_TURN)), "walker_policy.pt")
     log.close()
-    torch.save(dict(agent=agent.state_dict(), mean=norm.mean, var=norm.var, count=norm.count), "walker_policy.pt")
+    torch.save(dict(agent=agent.state_dict(), mean=norm.mean, var=norm.var, count=norm.count, version=VERSION,
+                    steer=(K_X, K_YAW, POLICY_TURN)), "walker_policy.pt")
     print("saved walker_policy.pt and walker_log.csv")
     return agent, norm
 
@@ -312,7 +333,7 @@ def evaluate(agent, norm, seconds=10.0, video="walker_trained.mp4"):
     camera = mujoco.MjvCamera()
     camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
     camera.trackbodyid = env.chassis
-    camera.distance, camera.azimuth, camera.elevation = 0.45, 0, -20
+    camera.distance, camera.azimuth, camera.elevation = 0.6, 90, -35   # from behind and above, so drift shows as left or right of the green line
     d = env.data[0]
     start_y, frames, falls, energy, worst = d.qpos[1], [], 0, 0.0, 0.0
     for _ in range(int(seconds / 0.02)):
@@ -323,7 +344,10 @@ def evaluate(agent, norm, seconds=10.0, video="walker_trained.mp4"):
         worst = max(worst, abs(d.qpos[0] - env.x0[0]))
         if renderer:
             renderer.update_scene(d, camera=camera)
-            frames.append(renderer.render())
+            frames.append(walker.annotate(renderer.render(),
+                                          f"distance forward: {(d.qpos[1] - start_y) * 100:+5.0f} cm",
+                                          f"off the line:      {(d.qpos[0] - env.x0[0]) * 100:+5.0f} cm",
+                                          f"time: {env.t[0] * 0.02:4.1f} s"))
         if info["fell"][0]:
             falls += 1
             env.reset_one(0)
@@ -364,14 +388,20 @@ if __name__ == "__main__":
     ap.add_argument("--envs", type=int, default=64, help="how many robots to simulate at once")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eval", action="store_true", help="skip training; replay walker_policy.pt")
+    ap.add_argument("--pure-rl", action="store_true", help="no built-in steering rule: the policy learns all of the steering itself")
     ap.add_argument("--no-dr", action="store_true", help="train without domain randomization (the nominal robot only)")
     ap.add_argument("--policy", default="walker_policy.pt", help="with --eval: which saved policy to replay")
     args = ap.parse_args()
     torch.set_num_threads(2)
+    if args.pure_rl:   # the policy must learn the steering itself: rule off, full turn authority
+        K_X, K_YAW, POLICY_TURN = 0.0, 0.0, 1.0
     if args.eval:
         ckpt = torch.load(args.policy, weights_only=False)
+        if ckpt.get("version") != VERSION:
+            raise SystemExit(f"{args.policy} was trained with an older action layout (left/right leg speeds); retrain with this version.")
         agent, norm = Agent(), Normalizer()
         agent.load_state_dict(ckpt["agent"])
+        K_X, K_YAW, POLICY_TURN = ckpt.get("steer", (6.0, 4.0, 1.0))    # the steering settings this policy was trained with
         norm.mean, norm.var, norm.count = ckpt["mean"], ckpt["var"], ckpt["count"]
     else:
         agent, norm = train(args)

@@ -58,9 +58,9 @@ if video:
     camera = mujoco.MjvCamera()
     camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING     # follow the robot
     camera.trackbodyid = chassis
-    camera.distance, camera.azimuth, camera.elevation = 0.45, 0, -20
+    camera.distance, camera.azimuth, camera.elevation = 0.6, 90, -35   # from behind and above, so drift shows as left or right of the green line
 frames = []
-steps = 0
+start_x, start_y = data.qpos[:2]    # for the distance shown on the video
 for end, forward, turn in PLAN:
     start = data.qpos[:2].copy()
     walker.command(model, data, forward, turn)
@@ -68,7 +68,10 @@ for end, forward, turn in PLAN:
         mujoco.mj_step(model, data)
         if video and data.time >= len(frames) / FPS:
             renderer.update_scene(data, camera=camera)
-            frames.append(renderer.render())
+            frames.append(walker.annotate(renderer.render(),
+                                          f"distance forward: {(data.qpos[1] - start_y) * 100:+5.0f} cm",
+                                          f"off the line:      {(data.qpos[0] - start_x) * 100:+5.0f} cm",
+                                          f"time: {data.time:4.1f} s"))
     up, yaw = status()
     dx, dy = data.qpos[:2] - start
     print(f"t={data.time:4.1f}s  forward={forward:+3g} turn={turn:+3g}:  moved x={dx * 100:+6.1f} cm, y={dy * 100:+6.1f} cm,"
